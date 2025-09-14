@@ -4,10 +4,8 @@ import time
 from typing import AsyncGenerator, Dict, Any, Optional, Union
 from contextlib import asynccontextmanager
 
-from langchain_community.llms import Ollama
-from langchain_core.prompts import PromptTemplate
-from langchain_core.callbacks import AsyncIteratorCallbackHandler
-from langchain_core.outputs import LLMResult
+import google.generativeai as genai
+from google.generativeai.types import GenerateContentResponse
 
 from config import settings
 import structlog
@@ -34,82 +32,65 @@ Prompt: {user_prompt}
 """
 }
 
-class OllamaServiceError(Exception):
-    """Custom exception for Ollama service errors"""
+class GeminiServiceError(Exception):
+    """Custom exception for Gemini service errors"""
     pass
 
-class OllamaConnectionError(OllamaServiceError):
-    """Exception raised when connection to Ollama fails"""
+class GeminiConnectionError(GeminiServiceError):
+    """Exception raised when connection to Gemini fails"""
     pass
 
-class OllamaTimeoutError(OllamaServiceError):
-    """Exception raised when Ollama request times out"""
+class GeminiTimeoutError(GeminiServiceError):
+    """Exception raised when Gemini request times out"""
     pass
 
-class AsyncOllamaCallbackHandler(AsyncIteratorCallbackHandler):
-    """Custom callback handler for async streaming with Ollama"""
+class GeminiService:
+    """Service class for interacting with Google Gemini 2.5 Flash models"""
     
     def __init__(self):
-        super().__init__()
-        self._queue = asyncio.Queue()
-        self._done = False
-    
-    async def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
-        """Handle new token from LLM"""
-        if not self._done:
-            await self._queue.put({"type": "token", "content": token})
-    
-    async def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
-        """Handle LLM completion"""
-        self._done = True
-        await self._queue.put({"type": "end", "content": response})
-    
-    async def on_llm_error(self, error: Union[Exception, KeyboardInterrupt], **kwargs: Any) -> None:
-        """Handle LLM errors"""
-        self._done = True
-        await self._queue.put({"type": "error", "content": str(error)})
-    
-    async def __aiter__(self):
-        """Async iterator for streaming tokens"""
-        while not self._done or not self._queue.empty():
-            try:
-                item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-                if item["type"] == "token":
-                    yield item["content"]
-                elif item["type"] == "end":
-                    break
-                elif item["type"] == "error":
-                    raise OllamaServiceError(f"LLM Error: {item['content']}")
-            except asyncio.TimeoutError:
-                continue
-
-class OllamaService:
-    """Service class for interacting with Ollama models"""
-    
-    def __init__(self):
-        self._client: Optional[Ollama] = None
-        self._connection_pool: Dict[str, Ollama] = {}
+        self._client: Optional[genai.GenerativeModel] = None
+        self._connection_pool: Dict[str, genai.GenerativeModel] = {}
         self._last_request_time = 0
         self._request_count = 0
+        self._initialized = False
     
-    async def _get_client(self, model: Optional[str] = None) -> Ollama:
-        """Get or create Ollama client with connection pooling"""
-        model = model or settings.OLLAMA_MODEL
-        model_key = f"{settings.OLLAMA_BASE_URL}_{model}"
+    async def _initialize_client(self):
+        """Initialize Gemini client with API key"""
+        if not self._initialized:
+            try:
+                if not settings.GEMINI_API_KEY:
+                    raise GeminiConnectionError("GEMINI_API_KEY not found in configuration")
+                
+                genai.configure(api_key=settings.GEMINI_API_KEY)
+                self._initialized = True
+                logger.info("Gemini client initialized successfully")
+            except Exception as e:
+                logger.error("Failed to initialize Gemini client", error=str(e))
+                raise GeminiConnectionError(f"Failed to initialize Gemini: {e}")
+    
+    async def _get_client(self, model: Optional[str] = None) -> genai.GenerativeModel:
+        """Get or create Gemini client with connection pooling"""
+        await self._initialize_client()
+        
+        model = model or settings.GEMINI_MODEL
+        model_key = f"gemini_{model}"
         
         if model_key not in self._connection_pool:
             try:
-                client = Ollama(
-                    model=model,
-                    base_url=settings.OLLAMA_BASE_URL,
-                    timeout=settings.OLLAMA_TIMEOUT,
-                    streaming=True
+                client = genai.GenerativeModel(
+                    model_name=model,
+                    generation_config={
+                        "max_output_tokens": settings.GEMINI_MAX_OUTPUT_TOKENS,
+                        "temperature": settings.GEMINI_TEMPERATURE,
+                        "top_p": settings.GEMINI_TOP_P,
+                        "top_k": settings.GEMINI_TOP_K,
+                    }
                 )
                 self._connection_pool[model_key] = client
-                logger.info("Created new Ollama client", model=model, base_url=settings.OLLAMA_BASE_URL)
+                logger.info("Created new Gemini client", model=model)
             except Exception as e:
-                logger.error("Failed to create Ollama client", error=str(e), model=model)
-                raise OllamaConnectionError(f"Failed to connect to Ollama: {e}")
+                logger.error("Failed to create Gemini client", error=str(e), model=model)
+                raise GeminiConnectionError(f"Failed to connect to Gemini: {e}")
         
         return self._connection_pool[model_key]
     
@@ -137,34 +118,34 @@ class OllamaService:
         """Retry function with exponential backoff"""
         last_exception = None
         
-        for attempt in range(settings.OLLAMA_MAX_RETRIES):
+        for attempt in range(3):  # Default retry count
             try:
                 return await func(*args, **kwargs)
             except Exception as e:
                 last_exception = e
-                if attempt < settings.OLLAMA_MAX_RETRIES - 1:
-                    delay = settings.OLLAMA_RETRY_DELAY * (2 ** attempt)
+                if attempt < 2:  # 3 attempts total
+                    delay = 1.0 * (2 ** attempt)  # Exponential backoff
                     logger.warning(
-                        "Ollama request failed, retrying",
+                        "Gemini request failed, retrying",
                         attempt=attempt + 1,
                         delay=delay,
                         error=str(e)
                     )
                     await asyncio.sleep(delay)
                 else:
-                    logger.error("Ollama request failed after all retries", error=str(e))
+                    logger.error("Gemini request failed after all retries", error=str(e))
                     raise last_exception
     
     @asynccontextmanager
     async def _request_context(self, user_prompt: str, model: Optional[str] = None):
-        """Context manager for Ollama requests with proper cleanup"""
+        """Context manager for Gemini requests with proper cleanup"""
         start_time = time.time()
         request_id = f"req_{int(start_time * 1000)}"
         
         logger.info(
-            "Starting Ollama request",
+            "Starting Gemini request",
             request_id=request_id,
-            model=model or settings.OLLAMA_MODEL,
+            model=model or settings.GEMINI_MODEL,
             prompt_length=len(user_prompt)
         )
         
@@ -173,7 +154,7 @@ class OllamaService:
             yield request_id
         except Exception as e:
             logger.error(
-                "Ollama request failed",
+                "Gemini request failed",
                 request_id=request_id,
                 error=str(e),
                 duration=time.time() - start_time
@@ -181,7 +162,7 @@ class OllamaService:
             raise
         finally:
             logger.info(
-                "Ollama request completed",
+                "Gemini request completed",
                 request_id=request_id,
                 duration=time.time() - start_time
             )
@@ -194,19 +175,19 @@ class OllamaService:
         **kwargs
     ) -> AsyncGenerator[str, None]:
         """
-        Stream blog content from Ollama with comprehensive error handling and monitoring.
+        Stream blog content from Gemini 2.5 Flash with comprehensive error handling and monitoring.
         
         Args:
             user_prompt: The user's prompt for blog content
             output_format: Output format ('html', 'markdown', 'plain')
-            model: Specific Ollama model to use
+            model: Specific Gemini model to use
             **kwargs: Additional parameters for the LLM
         
         Yields:
             Streaming content chunks
             
         Raises:
-            OllamaServiceError: For service-related errors
+            GeminiServiceError: For service-related errors
             ValueError: For invalid input parameters
         """
         # Validate input parameters
@@ -217,41 +198,34 @@ class OllamaService:
         
         async with self._request_context(sanitized_prompt, model) as request_id:
             try:
-                # Get Ollama client
+                # Get Gemini client
                 client = await self._get_client(model)
                 
-                # Create prompt template
-                prompt_template = PromptTemplate.from_template(PROMPT_TEMPLATES[output_format])
-                formatted_prompt = prompt_template.format(user_prompt=sanitized_prompt)
-                
-                # Create callback handler for streaming
-                callback_handler = AsyncOllamaCallbackHandler()
+                # Create formatted prompt
+                formatted_prompt = PROMPT_TEMPLATES[output_format].format(user_prompt=sanitized_prompt)
                 
                 # Execute with retry logic
                 async def execute_stream():
-                    return await client.agenerate(
-                        [formatted_prompt],
-                        callbacks=[callback_handler],
-                        **kwargs
+                    return await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: client.generate_content(formatted_prompt, stream=True)
                     )
                 
-                # Start streaming in background
-                stream_task = asyncio.create_task(execute_stream())
+                # Get streaming response
+                response_stream = await self._retry_with_backoff(execute_stream)
                 
                 # Stream tokens
-                async for token in callback_handler:
-                    yield token
-                
-                # Wait for completion
-                await stream_task
+                for chunk in response_stream:
+                    if chunk.text:
+                        yield chunk.text
                 
             except asyncio.TimeoutError:
-                raise OllamaTimeoutError(f"Request timed out after {settings.OLLAMA_TIMEOUT} seconds")
+                raise GeminiTimeoutError("Request timed out")
             except Exception as e:
-                if "connection" in str(e).lower():
-                    raise OllamaConnectionError(f"Connection to Ollama failed: {e}")
+                if "connection" in str(e).lower() or "api" in str(e).lower():
+                    raise GeminiConnectionError(f"Connection to Gemini failed: {e}")
                 else:
-                    raise OllamaServiceError(f"Unexpected error: {e}")
+                    raise GeminiServiceError(f"Unexpected error: {e}")
     
     async def generate_blog_content(
         self,
@@ -261,12 +235,12 @@ class OllamaService:
         **kwargs
     ) -> str:
         """
-        Generate complete blog content (non-streaming) from Ollama.
+        Generate complete blog content (non-streaming) from Gemini 2.5 Flash.
         
         Args:
             user_prompt: The user's prompt for blog content
             output_format: Output format ('html', 'markdown', 'plain')
-            model: Specific Ollama model to use
+            model: Specific Gemini model to use
             **kwargs: Additional parameters for the LLM
         
         Returns:
@@ -279,32 +253,36 @@ class OllamaService:
         return "".join(content_parts)
     
     async def get_model_info(self, model: Optional[str] = None) -> Dict[str, Any]:
-        """Get information about available Ollama models"""
+        """Get information about available Gemini models"""
         try:
-            client = await self._get_client(model)
-            # This would need to be implemented based on Ollama's API capabilities
+            await self._initialize_client()
+            model = model or settings.GEMINI_MODEL
             return {
-                "model": model or settings.OLLAMA_MODEL,
-                "base_url": settings.OLLAMA_BASE_URL,
-                "status": "connected"
+                "model": model,
+                "provider": "google_gemini",
+                "status": "connected",
+                "max_output_tokens": settings.GEMINI_MAX_OUTPUT_TOKENS,
+                "temperature": settings.GEMINI_TEMPERATURE,
+                "top_p": settings.GEMINI_TOP_P,
+                "top_k": settings.GEMINI_TOP_K
             }
         except Exception as e:
             logger.error("Failed to get model info", error=str(e))
-            raise OllamaServiceError(f"Failed to get model info: {e}")
+            raise GeminiServiceError(f"Failed to get model info: {e}")
     
     async def close(self):
         """Clean up resources and close connections"""
         self._connection_pool.clear()
-        logger.info("Ollama service connections closed")
+        logger.info("Gemini service connections closed")
 
 # Global service instance
-ollama_service = OllamaService()
+gemini_service = GeminiService()
 
 # Backward compatibility function
-async def stream_blog_from_ollama(user_prompt: str) -> AsyncGenerator[str, None]:
+async def stream_blog_from_gemini(user_prompt: str) -> AsyncGenerator[str, None]:
     """
     Backward compatibility function for streaming blog content.
-    Use OllamaService.stream_blog_content() for new implementations.
+    Use GeminiService.stream_blog_content() for new implementations.
     """
-    async for chunk in ollama_service.stream_blog_content(user_prompt, "html"):
-        yield chunk 
+    async for chunk in gemini_service.stream_blog_content(user_prompt, "html"):
+        yield chunk
